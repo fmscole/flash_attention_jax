@@ -1,8 +1,7 @@
 # 1. 导入必要的库
-import os, sys
-from pathlib import Path
-# 自动将 src 目录加入模块搜索路径
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import os,sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 # 必须在 import jax 之前设置：禁用 CUDA 命令缓冲区
 if '--xla_gpu_enable_command_buffer' not in os.environ.get('XLA_FLAGS', ''):
     os.environ['XLA_FLAGS'] = os.environ.get('XLA_FLAGS', '') + ' --xla_gpu_enable_command_buffer='
@@ -11,10 +10,6 @@ import time
 import jax
 import jax.numpy as jnp
 import optax
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from lib import stax_plus as stax
 from transformers.transformer_flash_v1 import Transformer
 import numpy as np
@@ -142,42 +137,6 @@ def clean_chinese_text(text):
     return text.strip()
 
 
-def load_un_corpus(en_path, zh_path, max_length, max_lines=None):
-    """加载 UN 平行语料库（en-zh 独立文件格式）。
-
-    每行一句，en 与 zh 文件行号对应。
-    max_lines 限制读取行数（None = 全部），用于词表采样。
-    """
-    en_sentences, cn_sentences, skipped = [], [], 0
-
-    if not os.path.exists(en_path):
-        logger.error(f"EN 文件不存在: {en_path}"); return [], []
-    if not os.path.exists(zh_path):
-        logger.error(f"ZH 文件不存在: {zh_path}"); return [], []
-
-    with open(en_path, 'r', encoding='utf-8') as f_en, \
-         open(zh_path, 'r', encoding='utf-8') as f_zh:
-        for i, (en_line, zh_line) in enumerate(zip(f_en, f_zh)):
-            if max_lines is not None and i >= max_lines:
-                break
-            en_text = en_line.strip()
-            cn_text = zh_line.strip()
-            if not en_text or not cn_text:
-                skipped += 1; continue
-            en_tokens = en_text.split()
-            cn_tokens = [t for t in jieba.cut(cn_text) if t.strip()]
-            if not en_tokens or not cn_tokens:
-                skipped += 1; continue
-            en_sentences.append(en_tokens)
-            cn_sentences.append(cn_tokens)
-            if i == 0:
-                logger.info(f"EN: {' '.join(en_tokens)}")
-                logger.info(f"CN: {' '.join(cn_tokens)}")
-
-    logger.info(f"加载 UN 语料: {len(en_sentences)} 句对, 跳过 {skipped}")
-    return en_sentences, cn_sentences
-
-
 def load_tatoeba_corpus(file_path, max_length):
     en_sentences, cn_sentences, skipped = [], [], 0
     if not os.path.exists(file_path):
@@ -242,66 +201,6 @@ class TranslationDataset:
 
     def __getitem__(self, idx):
         return self.source[idx], self.target[idx]
-
-
-class UNIterableDataset:
-    """分片流式读取 UN 平行语料库。
-
-    全量语料划分为 N 个 shard（默认每片 200K 行），
-    ``get_shard(i)`` 读取第 i 片、shuffle 后返回列表。
-    一个 epoch = 所有 shard 依次训练完毕。
-    """
-
-    def __init__(self, en_path, zh_path, val_offset=0, shard_size=200_000):
-        self.en_path = en_path
-        self.zh_path = zh_path
-        self.val_offset = val_offset
-        self.shard_size = shard_size
-        # 总行数缓存到 .meta 文件，避免每次启动扫 2.5 GB
-        meta_path = en_path + '.meta'
-        if os.path.exists(meta_path):
-            with open(meta_path, 'r') as f:
-                self._total = int(f.read().strip())
-        else:
-            self._total = sum(1 for _ in open(en_path, 'rb'))
-            with open(meta_path, 'w') as f:
-                f.write(str(self._total))
-        self._train_end = self._total - val_offset
-        self._num_shards = (self._train_end + shard_size - 1) // shard_size
-        logger.info(f"UN 语料: 总计 {self._total:,} 行, "
-                    f"训练 {self._train_end:,} 行, "
-                    f"{self._num_shards} shards (每片 {shard_size:,})")
-
-    @property
-    def num_shards(self):
-        return self._num_shards
-
-    def get_shard(self, shard_idx):
-        """读取第 shard_idx 个分片，返回 [(en_tokens, zh_tokens), ...]。"""
-        start = shard_idx * self.shard_size
-        end = min(start + self.shard_size, self._train_end)
-
-        buffer = []
-        with open(self.en_path, 'r', encoding='utf-8') as f_en, \
-             open(self.zh_path, 'r', encoding='utf-8') as f_zh:
-            for i, (en_line, zh_line) in enumerate(zip(f_en, f_zh)):
-                if i < start:
-                    continue
-                if i >= end:
-                    break
-                en_text = en_line.strip()
-                zh_text = zh_line.strip()
-                if not en_text or not zh_text:
-                    continue
-                en_tokens = en_text.split()
-                zh_tokens = [t for t in jieba.cut(zh_text) if t.strip()]
-                if not en_tokens or not zh_tokens:
-                    continue
-                buffer.append((en_tokens, zh_tokens))
-
-        import random
-        random.shuffle(buffer)
-        return buffer
 
 
 def collate_fn(batch, src_vocab, tgt_vocab, max_length):
@@ -465,98 +364,126 @@ def translate_examples(params, src_vocab, tgt_vocab,
         logger.info(f"  ZH: {''.join(tokens)}")
 
 
-def load_model(checkpoint_path, model_init, input_shapes):
+def load_checkpoint(checkpoint_path):
+    """加载检查点，兼容新旧格式。
+
+    Returns:
+        params, opt_state — 新格式 (params, opt_state) 元组
+                            旧格式仅 params，opt_state 为 None
+
+    加载后将 numpy 数组转回 JAX DeviceArray，避免 pickle 反序列化
+    产生的隐式类型转换导致 JIT re-trace 或数值问题。
+    """
     try:
         with open(checkpoint_path, "rb") as f:
-            params = pickle.load(f)
-        # 当前代码期望 params 为 4 元组 (enc_params, enc_bn, dec_params, dec_bn)
-        if not (isinstance(params, tuple) and len(params) == 4):
-            logger.warning(
-                f"检查点格式不兼容（期望 4 元组，得到 "
-                f"{type(params).__name__} 长度 {len(params) if isinstance(params, tuple) else 'N/A'}），重新初始化模型"
-            )
-            rng = jax.random.PRNGKey(0)
-            _, params = model_init(rng, input_shapes)
+            data = pickle.load(f)
+        if isinstance(data, tuple) and len(data) == 2:
+            params, opt_state = data
         else:
-            logger.info(f"加载检查点: {checkpoint_path}")
-        return params
+            params, opt_state = data, None
+
+        # pickle 将 DeviceArray 转为 numpy，这里显式挂回 GPU
+        params = jax.device_put(params)
+        if opt_state is not None:
+            opt_state = jax.device_put(opt_state)
+
+        fmt = "含优化器状态" if opt_state is not None else "旧格式，仅参数"
+        logger.info(f"加载检查点（{fmt}）: {checkpoint_path}")
+        return params, opt_state
     except FileNotFoundError:
-        logger.warning(f"检查点不存在，初始化新模型")
-        rng = jax.random.PRNGKey(0)
-        _, params = model_init(rng, input_shapes)
-        return params
+        logger.warning(f"检查点不存在: {checkpoint_path}")
+        return None, None
 
 
-def load_dataset_and_vocab(en_path, zh_path, vocab_dir, min_freq=3,
+def _params_valid(params):
+    """检查 pytree 中是否有 NaN/Inf。"""
+    for leaf in jax.tree_util.tree_leaves(params):
+        if jnp.isnan(leaf).any() or jnp.isinf(leaf).any():
+            return False
+    return True
+
+
+def init_model_params(model_init, input_shapes):
+    """初始化新模型参数。"""
+    rng = jax.random.PRNGKey(0)
+    _, params = model_init(rng, input_shapes)
+    return params
+
+
+def load_dataset_and_vocab(dataset_path, vocab_dir, min_freq=1,
                            max_vocab_size_src=55000, max_vocab_size_tgt=55000,
-                           max_length=64, batch_size=64,
-                           vocab_sample_lines=200_000, val_lines=5000):
-    """加载 UN 平行语料库 — 词表采样 + 流式训练。
+                           max_length=50, batch_size=32, val_ratio=0.1,
+                           val_dataset_path=None):
+    """加载数据、构建/加载词汇表、分割训练/验证集。
 
-    词表从前 vocab_sample_lines 行采样构建（首次运行，之后从缓存加载）。
-    训练数据通过 UNIterableDataset 流式读取，不整批加载到内存。
-    验证集固定从末尾取 val_lines 行。
+    返回 (src_vocab, tgt_vocab, train_loader, val_loader)。
 
-    返回 (src_vocab, tgt_vocab, train_dataset, val_loader)。
+    如果 val_dataset_path 指定了外部验证集，则用外部验证集替代随机切分。
+    词汇表从训练集构建（不暴露验证集词汇）。
     """
+    logger.info(f"加载数据集: {dataset_path}")
+    ext = os.path.splitext(dataset_path)[1].lower()
+    if ext == '.json':
+        en_sents, cn_sents = load_json_corpus(dataset_path)
+    elif ext in ['.txt', '.tsv']:
+        en_sents, cn_sents = load_tatoeba_corpus(dataset_path, max_length)
+    else:
+        raise ValueError(f"不支持的类型: {ext}")
+
+    if len(en_sents) == 0:
+        return None, None, None, None
+
     os.makedirs(vocab_dir, exist_ok=True)
     src_vocab_path = os.path.join(vocab_dir, "src_vocab.json")
     tgt_vocab_path = os.path.join(vocab_dir, "tgt_vocab.json")
 
-    # ── 词表：采样构建 / 从缓存加载 ──
     if os.path.exists(src_vocab_path) and os.path.exists(tgt_vocab_path):
         src_vocab = Vocabulary.load(src_vocab_path)
         tgt_vocab = Vocabulary.load(tgt_vocab_path)
     else:
-        logger.info(f"采样前 {vocab_sample_lines:,} 行构建词表...")
-        en_sents, cn_sents = load_un_corpus(
-            en_path, zh_path, max_length,
-            max_lines=vocab_sample_lines,
-        )
         src_vocab = Vocabulary().build_from_sentences(en_sents, min_freq, max_vocab_size_src)
         tgt_vocab = Vocabulary().build_from_sentences(cn_sents, min_freq, max_vocab_size_tgt)
         src_vocab.save(src_vocab_path)
         tgt_vocab.save(tgt_vocab_path)
-        logger.info(f"词表已缓存: EN={len(src_vocab):,}, ZH={len(tgt_vocab):,}")
 
-    # ── 验证集：从尾部取固定行数 ──
-    logger.info(f"加载验证集（末尾 {val_lines} 行）...")
-    # 复用 UNIterableDataset 的缓存行数统计
-    meta_path = en_path + '.meta'
-    if os.path.exists(meta_path):
-        with open(meta_path, 'r') as f:
-            _total = int(f.read().strip())
+    if val_dataset_path and os.path.exists(val_dataset_path):
+        # ── 使用外部验证集（不参与训练、不从训练集切分）──
+        val_en_sents, val_cn_sents = load_tatoeba_corpus(val_dataset_path, max_length)
+        logger.info(f"外部验证集: {len(val_en_sents)} 句对 (来自 {val_dataset_path})")
+
+        en_sents, cn_sents = np.array(en_sents, dtype=object), np.array(cn_sents, dtype=object)
+        val_en_sents, val_cn_sents = np.array(val_en_sents, dtype=object), np.array(val_cn_sents, dtype=object)
     else:
-        _total = sum(1 for _ in open(en_path, 'rb'))
-    skip_to = max(0, _total - val_lines)
-    val_en, val_zh = [], []
-    with open(en_path, 'r', encoding='utf-8') as f_en, \
-         open(zh_path, 'r', encoding='utf-8') as f_zh:
-        for i, (en_line, zh_line) in enumerate(zip(f_en, f_zh)):
-            if i < skip_to:
-                continue
-            en_tokens = en_line.strip().split()
-            zh_tokens = [t for t in jieba.cut(zh_line.strip()) if t.strip()]
-            if en_tokens and zh_tokens:
-                val_en.append(en_tokens)
-                val_zh.append(zh_tokens)
-    logger.info(f"验证集: {len(val_en)} 句对")
+        # ── 从训练集随机切分 10% 做验证（默认方式）──
+        n = len(en_sents)
+        rng_split = np.random.RandomState(42)
+        indices = rng_split.permutation(n)
+        split = int(n * (1 - val_ratio))
+        train_idx, val_idx = indices[:split], indices[split:]
+        logger.info(f"数据集分割: 训练 {len(train_idx)} + 验证 {len(val_idx)} (总计 {n})")
 
-    val_dataset = TranslationDataset(val_en, val_zh)
-    def collate_wrapper(b):
-        return collate_fn(b, src_vocab, tgt_vocab, max_length=max_length)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            collate_fn=collate_wrapper)
+        en_sents, cn_sents = np.array(en_sents, dtype=object), np.array(cn_sents, dtype=object)
+        val_en_sents, val_cn_sents = en_sents[val_idx], cn_sents[val_idx]
+        en_sents, cn_sents = en_sents[train_idx], cn_sents[train_idx]
 
-    # ── 训练：分片流式 Dataset ──
-    shard_size = 200000
-    train_dataset = UNIterableDataset(
-        en_path, zh_path,
-        val_offset=val_lines, shard_size=shard_size,
+    train_dataset = TranslationDataset(
+        [en_sents[i] for i in range(len(en_sents))],
+        [cn_sents[i] for i in range(len(cn_sents))],
+    )
+    val_dataset = TranslationDataset(
+        [val_en_sents[i] for i in range(len(val_en_sents))],
+        [val_cn_sents[i] for i in range(len(val_cn_sents))],
     )
 
-    logger.info(f"验证集: val_batches={len(val_loader)}")
-    return src_vocab, tgt_vocab, train_dataset, val_loader
+    def collate_wrapper(b):
+        return collate_fn(b, src_vocab, tgt_vocab, max_length=max_length)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              collate_fn=collate_wrapper)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            collate_fn=collate_wrapper)
+    logger.info(f"DataLoader: train_batches={len(train_loader)}, val_batches={len(val_loader)}")
+    return src_vocab, tgt_vocab, train_loader, val_loader
 
 
 def main():
@@ -567,24 +494,19 @@ def main():
     num_encoder_layers = 6
     num_decoder_layers = 6
     max_length = 64
-    block_size = 64  # FlashAttention 分块大小，等于 max_length 即单块模式
+    block_size = 1024  # FlashAttention 分块大小（auto-clamp 到可整除值）
     batch_size = 64
-
-    # ── 训练配置 ──
-    max_epochs = 200
-    warmup_steps = 4000
-    early_stop_patience = 5      # 验证不降连续 N 次即停
 
     np.random.seed(42)
     random.seed(42)
 
-    # ── UN 平行语料库 ──
-    en_file = "/mnt/e/data/UNv1.0.en-zh/en-zh/UNv1.0.en-zh.en"
-    zh_file = "/mnt/e/data/UNv1.0.en-zh/en-zh/UNv1.0.en-zh.zh"
-    src_vocab, tgt_vocab, train_dataset, val_loader = load_dataset_and_vocab(
-        en_file, zh_file, TRANSLATE_DIR, min_freq=3,
+    dataset_path = "./data/ai_challenger_zh_en.tsv"
+    val_dataset_path = "./data/ai_challenger_valid_zh_en.tsv"
+    src_vocab, tgt_vocab, train_loader, val_loader = load_dataset_and_vocab(
+        dataset_path, TRANSLATE_DIR, min_freq=1,
         max_vocab_size_src=55000, max_vocab_size_tgt=55000,
-        max_length=max_length, batch_size=batch_size,
+        max_length=max_length, batch_size=batch_size, val_ratio=0.1,
+        val_dataset_path=val_dataset_path,
     )
 
     # 构建模型 — 使用 transformer_flash.Transformer
@@ -602,138 +524,222 @@ def main():
         block_size=block_size,
     )
 
+    rng = jax.random.PRNGKey(0)
     src_shape = (batch_size, max_length)
     tgt_shape = (batch_size, max_length)
-    output_shape, _ = model_init(jax.random.PRNGKey(0), (src_shape, tgt_shape))
+    output_shape, params = model_init(rng, (src_shape, tgt_shape))
     print(f"模型输出形状: {output_shape}")
 
-    checkpoint_path = os.path.join(TRANSLATE_DIR, "model_un_en_zh.pkl")
-    params = load_model(checkpoint_path, model_init, (src_shape, tgt_shape))
+    checkpoint_path = os.path.join(TRANSLATE_DIR, f"model_{_Path(dataset_path).stem}.pkl")
+    best_checkpoint_path = os.path.join(TRANSLATE_DIR, f"model_{_Path(dataset_path).stem}_best.pkl")
+    safe_checkpoint_path = os.path.join(TRANSLATE_DIR, f"model_{_Path(dataset_path).stem}_safe.pkl")
+    curve_path = os.path.join(TRANSLATE_DIR, f"model_{_Path(dataset_path).stem}_curve.png")
+    history_path = os.path.join(TRANSLATE_DIR, f"model_{_Path(dataset_path).stem}_history.npz")
 
-    # 学习率调度（按 epoch × 实际每轮步数估算总步数）
-    steps_per_epoch = train_dataset.num_shards * (train_dataset.shard_size // batch_size)
-    max_steps = max_epochs * steps_per_epoch
+    # ── 加载已有检查点（支持续训）──
+    loaded_params, loaded_opt_state = load_checkpoint(checkpoint_path)
+    if loaded_params is not None and _params_valid(loaded_params):
+        params = loaded_params
+        logger.info("模型参数已从检查点恢复")
+    elif os.path.exists(safe_checkpoint_path):
+        logger.warning("常规检查点无效或缺失，回退到安全备份")
+        loaded_params, loaded_opt_state = load_checkpoint(safe_checkpoint_path)
+        params = loaded_params if loaded_params is not None else params
+    else:
+        logger.info("初始化新模型参数")
+
+    # 学习率调度: 短 warmup → 峰值后余弦衰减
     schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=1e-4,
-        warmup_steps=warmup_steps,
-        decay_steps=max_steps - warmup_steps,
-        end_value=1e-5,
+        init_value=0.0, peak_value=3e-5, warmup_steps=4000,
+        decay_steps=400000, end_value=1e-5,
     )
     # 优化器: 梯度裁剪 + AdamW
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate=schedule, weight_decay=0.0001),
     )
-    opt_state = optimizer.init(params)
+    if loaded_opt_state is not None:
+        opt_state = loaded_opt_state
+        logger.info("优化器状态已恢复")
+    else:
+        opt_state = optimizer.init(params)
+        logger.info("优化器状态重新初始化")
+
     train_step_fn = make_train_step(model_apply, optimizer, src_vocab, tgt_vocab)
     val_step_fn = make_val_step(model_apply, src_vocab, tgt_vocab)
 
-    logger.info(f"开始训练：max_epochs={max_epochs}, steps/epoch≈{steps_per_epoch}, "
-                f"warmup_steps={warmup_steps}")
+    num_epochs = 10000
+    validate_every = 10          # 每 N 个 epoch 跑一次验证
+    early_stop_patience = 3      # 验证连续不降即停（×validate_every = 30 epoch）
 
     best_val_loss = float('inf')
-    best_checkpoint_path = os.path.join(TRANSLATE_DIR, "model_un_en_zh_best.pkl")
     nan_recovery_count = 0
-    no_improve_count = 0
-    global_step = 0
-    train_losses = []      # 每个 shard 的 loss（用于绘图）
+    epochs_no_improve = 0
+    start_epoch = 0
 
-    rng = jax.random.PRNGKey(0)
+    # ── 训练历史（续训时追加）──
+    train_loss_history, val_loss_history, grad_norm_history = [], [], []
+    val_epochs_logged = []
+    if os.path.exists(history_path):
+        try:
+            old = np.load(history_path)
+            train_loss_history = list(old['train_loss'])
+            val_loss_history = list(old['val_loss'])
+            grad_norm_history = list(old['grad_norm'])
+            val_epochs_logged = list(old['val_epochs'])
+            start_epoch = len(train_loss_history)
+            logger.info(f"加载已有训练历史，从 epoch {start_epoch + 1} 继续")
+        except Exception as e:
+            logger.warning(f"加载训练历史失败，从头开始: {e}")
 
-    for epoch in range(1, max_epochs + 1):
-        epoch_start = time.time()
-        epoch_loss_sum = 0.0
-        epoch_batches = 0
+    # 评估最佳 val_loss（从 best checkpoint 反推，无效时回退到 safe）
+    best_val_loss = float('inf')
+    ckpt_to_eval = None
+    if os.path.exists(best_checkpoint_path):
+        ckpt_to_eval = best_checkpoint_path
+    elif os.path.exists(safe_checkpoint_path):
+        ckpt_to_eval = safe_checkpoint_path
 
-        for shard_idx in range(train_dataset.num_shards):
-            shard_start = time.time()
-            shard_data = train_dataset.get_shard(shard_idx)
+    if ckpt_to_eval:
+        best_params, _ = load_checkpoint(ckpt_to_eval)
+        if best_params is not None and _params_valid(best_params):
+            best_val_loss = validate_epoch(val_step_fn, best_params, val_loader)
+            logger.info(f"评估最佳检查点 ({ckpt_to_eval}) val_loss={best_val_loss:.4f}")
 
-            shard_loss_sum = 0.0
-            shard_batches = 0
-            batch = []
-            for en_sent, zh_sent in shard_data:
-                batch.append((en_sent, zh_sent))
-                if len(batch) >= batch_size:
-                    src_mat, tgt_mat = collate_fn(batch, src_vocab, tgt_vocab, max_length)
-                    rng, step_rng = jax.random.split(rng)
-                    params, opt_state, loss, pred, grad_norm = train_step_fn(
-                        params, (src_mat, tgt_mat), opt_state, step_rng)
-                    global_step += 1
-                    batch = []
+    logger.info(f"开始训练，共 {num_epochs} 周期 (早停 patience={early_stop_patience})")
 
-                    # NaN/Inf 检测（必须在累加 loss 之前）
-                    if jnp.isnan(loss) or jnp.isinf(loss):
-                        logger.error(f"epoch {epoch}, shard {shard_idx+1}, "
-                                     f"step {global_step}: loss 为 NaN/Inf，恢复检查点")
-                        nan_recovery_count += 1
-                        try:
-                            with open(checkpoint_path, "rb") as f:
-                                params = pickle.load(f)
-                            opt_state = optimizer.init(params)
-                            logger.warning(f"已从 {checkpoint_path} 恢复参数")
-                        except FileNotFoundError:
-                            logger.error("无可用检查点，跳过此 batch")
+    for epoch in range(start_epoch, num_epochs):
+        epoch_loss, num_batches = 0.0, 0
+        begin_time = time.time()
+        pred = None
+        grad_norms = []
+
+        # ---- 训练 ----
+        for batch_idx, (src_inputs, tgt_inputs) in enumerate(train_loader):
+            rng, step_rng = jax.random.split(rng)
+            params, opt_state, loss, pred, grad_norm = train_step_fn(
+                params, (src_inputs, tgt_inputs), opt_state, step_rng)
+            
+            # NaN/Inf 检测：loss 异常时从安全检查点恢复
+            if jnp.isnan(loss) or jnp.isinf(loss):
+                logger.error(f"epoch {epoch+1}, batch {batch_idx}: loss 为 NaN/Inf，恢复检查点")
+                nan_recovery_count += 1
+                recovered = False
+                for ckpt in [safe_checkpoint_path, checkpoint_path]:
+                    if not os.path.exists(ckpt):
                         continue
+                    try:
+                        with open(ckpt, "rb") as f:
+                            data = pickle.load(f)
+                        if isinstance(data, tuple) and len(data) == 2:
+                            params, opt_state = data
+                        else:
+                            params = data
+                            opt_state = optimizer.init(params)
+                        params = jax.device_put(params)
+                        opt_state = jax.device_put(opt_state) if opt_state is not None else None
+                        recovered = True
+                        logger.warning(f"已从 {ckpt} 恢复参数和优化器状态")
+                        break
+                    except Exception:
+                        continue
+                if not recovered:
+                    logger.error("无可用检查点，跳过此 batch")
+                continue
+            
+            epoch_loss += loss
+            num_batches += 1
+            grad_norms.append(float(grad_norm))
+            
+            if batch_idx % 500 == 0:
+                logger.info(f"epoch {epoch+1}/{num_epochs}, batch {batch_idx}, "
+                           f"loss: {loss:.4f}, grad_norm: {grad_norm:.4f}")
 
-                    shard_loss_sum += loss
-                    shard_batches += 1
+        avg_train_loss = epoch_loss / max(num_batches, 1)
+        avg_grad_norm = sum(grad_norms) / max(len(grad_norms), 1)
 
-            shard_avg_loss = float(shard_loss_sum / max(shard_batches, 1))
-            epoch_loss_sum += shard_loss_sum
-            epoch_batches += shard_batches
-            train_losses.append(shard_avg_loss)
-
-            # ── 每片结束：打印 + 保存模型 + 画曲线 + 翻译示例 ──
-            print(f"  epoch {epoch:3d}/{max_epochs}, shard {shard_idx+1:3d}/{train_dataset.num_shards} | "
-                  f"loss={shard_avg_loss:.4f} | batches={shard_batches} | "
-                  f"{time.time()-shard_start:.1f}s")
-
+        # ---- 检查点保存（仅参数有效时保存）----
+        if _params_valid(params):
             with open(checkpoint_path, "wb") as f:
-                pickle.dump(params, f)
-
-            translate_examples(params, src_vocab, tgt_vocab,
-                               model_encode, model_decode, max_length)
-
-            plt.figure(figsize=(10, 5))
-            plt.plot(range(1, len(train_losses) + 1), train_losses, 'b-', linewidth=0.8)
-            plt.xlabel('Shard (across epochs)')
-            plt.ylabel('Loss')
-            plt.title(f'UN EN→ZH Translation — Loss (epoch {epoch}, shard {shard_idx+1})')
-            plt.grid(True, alpha=0.3)
-            plt.savefig(os.path.join(TRANSLATE_DIR, 'training_curve.png'), dpi=150)
-            plt.close()
-
-        # ── 每 epoch 结束：验证 + 翻译示例 ──
-        epoch_time = time.time() - epoch_start
-        avg_loss = float(epoch_loss_sum / max(epoch_batches, 1))
-        logger.info(f"epoch {epoch}/{max_epochs} | loss={avg_loss:.4f} | "
-                    f"steps={global_step} | {epoch_time:.1f}s")
-
-        val_loss = validate_epoch(val_step_fn, params, val_loader)
-        logger.info(f"epoch {epoch}: val_loss={val_loss:.4f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            no_improve_count = 0
-            with open(best_checkpoint_path, "wb") as f:
-                pickle.dump(params, f)
-            logger.info(f"epoch {epoch}: ★ 新最佳模型 (val_loss={best_val_loss:.4f})")
+                pickle.dump((params, opt_state), f)
         else:
-            no_improve_count += 1
-            logger.info(f"epoch {epoch}: 连续 {no_improve_count} 次验证未改善 "
-                        f"(patience={early_stop_patience})")
+            logger.error(f"epoch {epoch+1}: 参数含 NaN/Inf，跳过保存")
 
-        # 早停
-        if no_improve_count >= early_stop_patience:
-            logger.info(f"早停触发：验证 loss 连续 {early_stop_patience} 次未改善，"
-                        f"最佳 val_loss={best_val_loss:.4f}")
-            break
+        # ---- 验证 + 最佳/安全模型保存（每 validate_every epoch）----
+        if (epoch + 1) % validate_every == 0:
+            val_loss = validate_epoch(val_step_fn, params, val_loader)
+            logger.info(f"epoch {epoch+1}: train_loss={avg_train_loss:.4f}, "
+                        f"val_loss={val_loss:.4f}, grad_norm={avg_grad_norm:.4f}")
 
-        print(f"Epoch {epoch}/{max_epochs} 完成，耗时 {epoch_time:.2f}s")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                with open(best_checkpoint_path, "wb") as f:
+                    pickle.dump((params, opt_state), f)
+                with open(safe_checkpoint_path, "wb") as f:
+                    pickle.dump((params, opt_state), f)
+                logger.info(f"epoch {epoch+1}: ★ 新最佳模型 (val_loss={best_val_loss:.4f})，已保存 + 安全备份")
+            else:
+                epochs_no_improve += 1
+
+            # 早停
+            if epochs_no_improve >= early_stop_patience:
+                logger.info(f"早停触发：val_loss 连续 {early_stop_patience} 次未改善，"
+                            f"最佳 val_loss={best_val_loss:.4f}")
+                break
+
+        # ---- 翻译示例（每个 epoch）----
+        translate_examples(params, src_vocab, tgt_vocab,
+                           model_encode, model_decode, max_length)
+        print("-------------------------------------------------")
+        if pred is not None:
+            print("pred    ", ''.join(tgt_vocab.decode(pred[0], remove_special=True)))
+        print("-------------------------------------------------")
+
+        print(f"Epoch {epoch+1} 完成，耗时 {time.time() - begin_time:.2f}s")
         print("=" * 50)
 
-    print(f"\n训练结束。最佳 val_loss={best_val_loss:.4f}，NaN 恢复次数: {nan_recovery_count}")
+        # ── 记录训练历史 ──
+        train_loss_history.append(float(avg_train_loss))
+        grad_norm_history.append(float(avg_grad_norm))
+        # val_loss: 验证未执行的 epoch 记 NaN（图上不连线）
+        if (epoch + 1) % validate_every == 0:
+            val_loss_history.append(float(val_loss))
+            val_epochs_logged.append(epoch + 1)
+
+        np.savez(history_path,
+                 train_loss=np.array(train_loss_history),
+                 val_loss=np.array(val_loss_history),
+                 grad_norm=np.array(grad_norm_history),
+                 val_epochs=np.array(val_epochs_logged))
+
+        # ── 绘图 ──
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        epochs_arr = range(1, len(train_loss_history) + 1)
+        axes[0].plot(epochs_arr, train_loss_history, 'b-', label='Train Loss', linewidth=0.8)
+        if val_loss_history:
+            axes[0].plot(val_epochs_logged, val_loss_history, 'rs-',
+                         label='Val Loss', markersize=4, linewidth=0.8)
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('Loss')
+        axes[0].set_title('Training & Validation Loss')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].plot(epochs_arr, grad_norm_history, 'g-', linewidth=0.8)
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Gradient Norm')
+        axes[1].set_title('Gradient Norm')
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(curve_path, dpi=150)
+        plt.close(fig)
+
+    print(f"\n训练结束。最佳 val_loss: {best_val_loss:.4f}，NaN 恢复次数: {nan_recovery_count}")
 
 
 if __name__ == "__main__":

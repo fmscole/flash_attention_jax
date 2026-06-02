@@ -92,20 +92,28 @@ python src/vit/vit_cifar10_mae_finetune_stax.py
 
 ## 翻译模型 (EN→ZH)
 
-基于 Flash Attention 的 Encoder-Decoder Transformer，使用联合国中英平行语料库进行训练。
+基于 Flash Attention 的 Encoder-Decoder Transformer，使用 AiChallenger 机器翻译数据集（1000 万句对）进行训练。
 
 ### 数据集
 
-**UNv1.0.en-zh** — 联合国官方文件平行语料（英中方向），约 2000 万句对。
+**AiChallenger 机器翻译数据集** — 通用领域中英平行语料，约 1000 万句对。
 
-- 官网: https://conferences.unite.un.org/UNCorpus/Home/DownloadOverview
-- 国内镜像: https://aistudio.baidu.com/datasetdetail/163038
+- 下载地址: [AiChallenger 机器翻译](https://aistudio.baidu.com/datasetdetail/220848)
+- 本地路径: `H:\data_set\AiChallenger\`
+- 格式: 已对齐的 `train.en` / `train.zh`（各 1000 万行，行号对应）
+- 验证集: `valid.en-zh.en.sgm` / `valid.en-zh.zh.sgm`（各 8000 句）
+- 清洗脚本: `src/translation/prepare_ai_challenger.py`
 
-下载后解压到 `E:\data\UNv1.0.en-zh\`，包含两个文件：
+```bash
+# 从原始文件生成训练集 + 验证集 TSV（默认输出 300 万句对训练 + 8000 句对验证）
+python src/translation/prepare_ai_challenger.py
 ```
-UNv1.0.en-zh.en   — 英文原文（约 2.3 GB，约 2000 万行）
-UNv1.0.en-zh.zh   — 中文译文（约 1.8 GB）
-```
+
+输出:
+| 文件 | 内容 | 大小 |
+|------|------|------|
+| `data/ai_challenger_zh_en.tsv` | 训练集 (en\tzh) | ~232 MB |
+| `data/ai_challenger_valid_zh_en.tsv` | 官方验证集 (en\tzh) | ~887 KB |
 
 ### 模型架构
 
@@ -121,7 +129,7 @@ UNv1.0.en-zh.zh   — 中文译文（约 1.8 GB）
 ### 用法
 
 ```bash
-# 训练（配置已内置于 translate_stax_flash.py）
+# 训练（需先运行 prepare_ai_challenger.py 生成 TSV）
 python src/translation/translate_stax_flash.py
 ```
 
@@ -129,21 +137,18 @@ python src/translation/translate_stax_flash.py
 
 | 配置 | 值 |
 |------|-----|
-| 训练模式 | epoch-based（全量分片，每片 200K 行，片内 shuffle） |
-| 数据分片 | 全量语料划分为 ~80 个 shard，每片读完打印一次 loss |
-| Max epochs | 200 |
+| 数据集 | AiChallenger 机器翻译（通用领域，~1000 万句对） |
+| 训练模式 | epoch-based |
+| Max epochs | 10000（早停触发终止） |
 | Optimizer | AdamW (weight_decay=1e-4) |
-| Peak LR | 1e-4, warmup 4000 steps, cosine decay → 1e-5 |
+| Peak LR | 3e-5, warmup 4000 steps, cosine decay → 1e-5 |
 | Batch size | 64 |
 | Max length | 64 |
 | Grad clip | global norm 1.0 |
-| 保存 | **每 shard 自动保存** — `model_un_en_zh.pkl`，重启自动加载 |
-| 训练曲线 | **每 shard 更新绘制** → `translate_jax/training_curve.png`（x 轴 = shard 序号） |
-| 验证 | **每 epoch**（即每扫完全量一次）— 通过时保存 `*_best.pkl` |
-| 早停 | val loss 连续 5 次验证不降即停 |
-| 词表 | 从前 200K 行采样构建，min_freq=3 |
-| 验证集 | 末尾 5000 句（固定） |
-| 检查点 | `translate_jax/model_un_en_zh.pkl` + `*_best.pkl` |
+| 保存 | 每 epoch 自动保存 — `model_ai_challenger_zh_en.pkl`（含优化器状态），重启自动恢复 |
+| 训练曲线 | 每 epoch 更新绘制 → `translate_jax/model_ai_challenger_zh_en_curve.png` |
+| 验证 | 每 10 epoch — 官方验证集 8000 句（非随机切分），通过时保存 `*_best.pkl` |
+| 早停 | val loss 连续 3 次验证不降即停（约 30 epoch） |
 
 推理时使用贪心解码，每个时间步取 argmax，遇到 `<eos>` 停止。
 
