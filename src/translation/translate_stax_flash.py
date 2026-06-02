@@ -684,13 +684,16 @@ def main():
             epoch_batches += shard_batches
             train_losses.append(shard_avg_loss)
 
-            # ── 每片结束：打印 + 保存模型 + 画曲线 ──
+            # ── 每片结束：打印 + 保存模型 + 画曲线 + 翻译示例 ──
             print(f"  epoch {epoch:3d}/{max_epochs}, shard {shard_idx+1:3d}/{train_dataset.num_shards} | "
                   f"loss={shard_avg_loss:.4f} | batches={shard_batches} | "
                   f"{time.time()-shard_start:.1f}s")
 
             with open(checkpoint_path, "wb") as f:
                 pickle.dump(params, f)
+
+            translate_examples(params, src_vocab, tgt_vocab,
+                               model_encode, model_decode, max_length)
 
             plt.figure(figsize=(10, 5))
             plt.plot(range(1, len(train_losses) + 1), train_losses, 'b-', linewidth=0.8)
@@ -706,9 +709,6 @@ def main():
         avg_loss = float(epoch_loss_sum / max(epoch_batches, 1))
         logger.info(f"epoch {epoch}/{max_epochs} | loss={avg_loss:.4f} | "
                     f"steps={global_step} | {epoch_time:.1f}s")
-
-        translate_examples(params, src_vocab, tgt_vocab,
-                           model_encode, model_decode, max_length)
 
         val_loss = validate_epoch(val_step_fn, params, val_loader)
         logger.info(f"epoch {epoch}: val_loss={val_loss:.4f}")
