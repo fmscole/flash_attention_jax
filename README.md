@@ -90,6 +90,63 @@ python src/vit/vit_cifar10_mae_finetune_stax.py
 
 **对比**: 单阶段监督训练可达 90–91%；两阶段 MAE 自监督预训练 + 微调可达 **94.92%**（高出约 4–5 个百分点）。
 
+## 翻译模型 (EN→ZH)
+
+基于 Flash Attention 的 Encoder-Decoder Transformer，使用联合国中英平行语料库进行训练。
+
+### 数据集
+
+**UNv1.0.en-zh** — 联合国官方文件平行语料（英中方向），约 2000 万句对。
+
+- 官网: https://conferences.unite.un.org/UNCorpus/Home/DownloadOverview
+- 国内镜像: https://aistudio.baidu.com/datasetdetail/163038
+
+下载后解压到 `E:\data\UNv1.0.en-zh\`，包含两个文件：
+```
+UNv1.0.en-zh.en   — 英文原文（约 2.3 GB，约 2000 万行）
+UNv1.0.en-zh.zh   — 中文译文（约 1.8 GB）
+```
+
+### 模型架构
+
+| 组件 | 配置 |
+|------|------|
+| Encoder / Decoder | 各 6 层 Pre-LN Transformer |
+| Attention | Flash Attention v1（通过 `Transformer` 封装） |
+| Hidden dim | 512 (8 heads × 64 head_dim) |
+| FFN dim | 2048 |
+| 词表 | 各 55,000（BPE-free，基于词频构建） |
+| 特殊标记 | `<pad>`, `<sos>`, `<eos>`, `<unk>` |
+
+### 用法
+
+```bash
+# 训练（配置已内置于 translate_stax_flash.py）
+python src/translation/translate_stax_flash.py
+```
+
+### 训练细节
+
+| 配置 | 值 |
+|------|-----|
+| 训练模式 | epoch-based（每 epoch 流式读取 ~200K 句随机切片） |
+| Max epochs | 200 |
+| Optimizer | AdamW (weight_decay=1e-4) |
+| Peak LR | 1e-4, warmup 4000 steps, cosine decay → 1e-5 |
+| Batch size | 64 |
+| Max length | 64 |
+| Grad clip | global norm 1.0 |
+| 保存 | **每 epoch 自动保存** — `model_un_en_zh.pkl`，重启自动加载 |
+| 验证 | **每 10 epoch** — 通过时保存 `*_best.pkl` |
+| 训练曲线 | **每 epoch 绘制** → `translate_jax/training_curve.png`（替换旧图） |
+| 早停 | val loss 连续 5 次验证不降即停 |
+| 词表 | 从前 500K 行采样构建，min_freq=3 |
+| 验证集 | 末尾 5000 句（固定） |
+| 训练数据 | 流式 `UNIterableDataset`（避免 OOM） |
+| 检查点 | `translate_jax/model_un_en_zh.pkl` + `*_best.pkl` |
+
+推理时使用贪心解码，每个时间步取 argmax，遇到 `<eos>` 停止。
+
 ## License
 
 MIT
