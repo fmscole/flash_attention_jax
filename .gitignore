@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# JAX / XLA
+.xla/
+*.hlo
+xla_*log*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+translate_jax/
+checkpoints/
+ckpt/
+data/
+runs/
+*.log
+
+# 权重 / 检查点
+*.pkl
+*.npz
+*.h5
+*.hdf5
+*.safetensors
+*.bin
+*.pt
+*.pth

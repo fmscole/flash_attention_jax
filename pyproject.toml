@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-attention-jax"
+version = "0.2.0"
+description = "Flash Attention for JAX — IO-aware exact attention with custom VJP, plus Transformer/ViT/Translation examples"
+authors = []
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "flax>=0.7.0",
+    "optax>=0.1.7",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+    "opencv-python>=4.8.0",
+    "tqdm>=4.65.0",
+    "chex>=0.1.7",
+    "einops>=0.6.0",
+    "ml-collections>=0.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1.0",
+]
+test = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["flash_attention", "lib", "transformers", "translation", "vit"]
+
+[tool.pytest.ini_options]
+testpaths = ["src"]
+python_files = ["test_*.py", "*_test.py"]
+filterwarnings = ["ignore::RuntimeWarning"]
+markers = []
