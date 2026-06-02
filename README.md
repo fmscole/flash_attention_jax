@@ -152,6 +152,45 @@ python src/translation/translate_stax_flash.py
 
 推理时使用贪心解码，每个时间步取 argmax，遇到 `<eos>` 停止。
 
+### 训练进展
+
+**Epoch 1**（约 2 小时，batch_size=64，46875 batches）:
+
+| 指标 | 值 |
+|------|-----|
+| Loss（batch 0） | 10.90 |
+| Loss（batch 500） | 9.95 |
+| Loss（batch 44500–46500） | 2.90 ~ 3.24 |
+| Grad norm | 3.0 ~ 4.0 |
+
+第 1 个 epoch 结束时的翻译示例（贪心解码）:
+
+```
+EN: they planted roses along the fence every spring morning
+ZH: 每天早上他们都在<unk><unk>了玫瑰
+
+EN: he missed the train because his alarm never rang
+ZH: 他错过了火车因为他的警报没有
+
+EN: he is also very famous in japan
+ZH: 他也是日本人
+
+EN: i don 't expect anything from you
+ZH: 我不希望你能得到什么
+
+EN: i found it easy to speak english
+ZH: 我知道说英语很容易
+
+EN: she opened the old wooden box and found a letter inside
+ZH: 她打开了旧的<unk>在里面找到了一封信
+
+EN: time passes quickly when we 're doing something we like .
+ZH: 我们现在的时候需要的时候时间就快
+
+EN: tom needs to study more if he hopes to pass this class .
+ZH: 如果他希望通过这个课需要更多学习
+```
+
 ## License
 
 MIT
