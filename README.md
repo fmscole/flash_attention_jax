@@ -154,7 +154,7 @@ python src/translation/translate_stax_flash.py
 
 ### 训练进展
 
-**Epoch 1**（约 2 小时，batch_size=64，46875 batches）:
+**Epoch 1**（~51 min，batch_size=64，46875 batches）:
 
 | 指标 | 值 |
 |------|-----|
