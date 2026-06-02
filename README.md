@@ -40,6 +40,56 @@ output = flash_attention_v2(q, k, v, causal=True, block_size_q=128, block_size_k
 分块模式下 (block_size < seq_len) 使用统一的 `_MIN_NORMALIZER=1e-12` 确保
 前向归一化和反向 log-sum-exp 恢复权重完全一致，消除梯度漂移。
 
+## Vision Transformer (CIFAR-10)
+
+三个示例脚本，覆盖从零训练到两阶段自监督微调的完整流程。
+
+### 脚本对比
+
+| 脚本 | 方法 | 准确率 | 前置依赖 |
+|------|------|--------|----------|
+| `vit_cifar10_stax.py` | 端到端监督训练 | 90~91% | 无 |
+| `vit_cifar10_mae_pretrain_stax.py` | Stage 1: MAE 自监督预训练（重建 masked patches） | — | 无 |
+| `vit_cifar10_mae_finetune_stax.py` | Stage 2: 加载预训练 Encoder + 分类头微调 | **94.92%** | `ckpt/vit_cifar10_mae_pretrain.pkl` |
+
+### 模型架构
+
+三者共享相同的 backbone 设计（CIFAR-10 图像 32×32）：
+
+- **Patch Embed**: Conv 4×4, stride 4 → 64 patches（每块 4×4×3=48 维）
+- **Embed dim**: 384, **Heads**: 6, **Layers**: 7, **MLP dim**: 768
+- **位置编码**: 可学习（非正弦固定）
+- **注意力**: Flash Attention v1（通过 `TransformerEncoderBlock`）
+
+### 用法
+
+```bash
+# 1. 端到端监督训练（约 500 epoch）
+python src/vit/vit_cifar10_stax.py
+
+# 2. MAE 自监督预训练（100 epoch，仅重建损失，不需标签）
+python src/vit/vit_cifar10_mae_pretrain_stax.py
+
+# 3. 加载预训练权重微调（100 epoch，需先完成 step 2）
+python src/vit/vit_cifar10_mae_finetune_stax.py
+```
+
+### 训练细节
+
+| 配置 | 监督 (vit_cifar10_stax) | MAE 预训练 | MAE 微调 |
+|------|------------------------|------------|----------|
+| Epochs | 500 | 100 | 100 |
+| Optimizer | AdamW | AdamW | AdamW |
+| Peak LR | 3e-4 | 1.5e-4 | 1e-4 |
+| LR schedule | warmup 10ep + cosine decay | warmup 20ep + cosine decay | warmup 20ep + cosine decay |
+| Weight decay | 0.1 | 0.05 | 0.05 |
+| Batch size | 128 | 128 | 128 |
+| Dropout | 0.2 | — | 0.1 |
+| Data aug | RandAugment + MixUp(α=0.8) | RandomCrop + Flip | RandAugment + MixUp(α=0.8) |
+| Label smoothing | 0.1 | — | 0.1 |
+
+**两阶段提升路径**: 单阶段监督 90~91% → MAE 预训练（图像重建，充分学习视觉表征）→ 加载 Encoder + 分类头微调 **94.92%**，+4~5 个百分点。
+
 ## License
 
 MIT
