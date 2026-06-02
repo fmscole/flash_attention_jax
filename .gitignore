@@ -41,3 +41,6 @@ runs/
 *.bin
 *.pt
 *.pth
+
+# 缓存
+*.meta

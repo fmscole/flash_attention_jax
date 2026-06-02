@@ -129,20 +129,20 @@ python src/translation/translate_stax_flash.py
 
 | 配置 | 值 |
 |------|-----|
-| 训练模式 | epoch-based（每 epoch 流式读取 ~200K 句随机切片） |
+| 训练模式 | epoch-based（全量分片，每片 200K 行，片内 shuffle） |
+| 数据分片 | 全量语料划分为 ~80 个 shard，每片读完打印一次 loss |
 | Max epochs | 200 |
 | Optimizer | AdamW (weight_decay=1e-4) |
 | Peak LR | 1e-4, warmup 4000 steps, cosine decay → 1e-5 |
 | Batch size | 64 |
 | Max length | 64 |
 | Grad clip | global norm 1.0 |
-| 保存 | **每 epoch 自动保存** — `model_un_en_zh.pkl`，重启自动加载 |
-| 验证 | **每 10 epoch** — 通过时保存 `*_best.pkl` |
-| 训练曲线 | **每 epoch 绘制** → `translate_jax/training_curve.png`（替换旧图） |
+| 保存 | **每 shard 自动保存** — `model_un_en_zh.pkl`，重启自动加载 |
+| 训练曲线 | **每 shard 更新绘制** → `translate_jax/training_curve.png`（x 轴 = shard 序号） |
+| 验证 | **每 epoch**（即每扫完全量一次）— 通过时保存 `*_best.pkl` |
 | 早停 | val loss 连续 5 次验证不降即停 |
-| 词表 | 从前 500K 行采样构建，min_freq=3 |
+| 词表 | 从前 200K 行采样构建，min_freq=3 |
 | 验证集 | 末尾 5000 句（固定） |
-| 训练数据 | 流式 `UNIterableDataset`（避免 OOM） |
 | 检查点 | `translate_jax/model_un_en_zh.pkl` + `*_best.pkl` |
 
 推理时使用贪心解码，每个时间步取 argmax，遇到 `<eos>` 停止。
