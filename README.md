@@ -88,7 +88,7 @@ python src/vit/vit_cifar10_mae_finetune_stax.py
 | Data aug | RandAugment + MixUp(α=0.8) | RandomCrop + Flip | RandAugment + MixUp(α=0.8) |
 | Label smoothing | 0.1 | — | 0.1 |
 
-**对比**: 单阶段监督训练可达 90~91%；两阶段 MAE 自监督预训练 + 微调可达 **94.92%**（+4~5 个百分点）。
+**对比**: 单阶段监督训练可达 90–91%；两阶段 MAE 自监督预训练 + 微调可达 **94.92%**（高出约 4–5 个百分点）。
 
 ## License
 
