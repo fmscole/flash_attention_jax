@@ -94,6 +94,10 @@ python src/vit/vit_cifar10_mae_finetune_stax.py
 
 基于 Flash Attention 的 Encoder-Decoder Transformer，使用 AiChallenger 机器翻译数据集（1000 万句对）进行训练。
 
+提供两种训练路径：
+- **单阶段**: 随机初始化，直接在平行语料上端到端训练
+- **两阶段**: BART 风格 — Stage 1 在单语中文上做去噪预训练，Stage 2 加载预训练权重微调翻译
+
 ### 数据集
 
 **AiChallenger 机器翻译数据集** — 通用领域中英平行语料，约 1000 万句对。
@@ -190,6 +194,101 @@ ZH: 我们现在的时候需要的时候时间就快
 EN: tom needs to study more if he hopes to pass this class .
 ZH: 如果他希望通过这个课需要更多学习
 ```
+
+### 两阶段训练：去噪预训练 + 翻译微调
+
+除单阶段端到端训练外，还提供两阶段 BART 风格训练路径，利用海量单语中文数据预训练解码器生成能力，再迁移到平行翻译任务。
+
+**参考**: Lewis et al. "BART: Denoising Sequence-to-Sequence Pre-training for Natural Language Generation, Translation, and Comprehension" (2019)
+
+#### 流程概览
+
+| 阶段 | 脚本 | 任务 | 数据 | 输出 |
+|------|------|------|------|------|
+| Stage 1 | `translate_denoise_pretrain_stax.py` | BART 去噪自编码（破坏中文 → 重建中文） | 单语中文（从 AiChallenger TSV 提取） | `ckpt/translate_denoise_pretrain.pkl` |
+| Stage 2 | `translate_denoise_finetune_stax.py` | 翻译微调（EN → ZH） | AiChallenger 平行语料 | 最终翻译模型 |
+
+#### Stage 1: 去噪预训练
+
+**原理**: Encoder 接收被破坏的中文文本（随机 mask + 删除），Decoder 重建原文。此阶段学习：
+- **Decoder**: 生成流畅中文的能力（完整迁移到 Stage 2）
+- **Encoder blocks**: 通用序列表示能力（迁移到 Stage 2）
+- **Encoder embedding**: 中文词语义（Stage 2 替换为英文 embedding）
+
+**破坏策略**:
+| 操作 | 比例 | 说明 |
+|------|------|------|
+| Token Masking | 30% | 替换为 `<mask>` 标记 |
+| Token Deletion | 20% | 直接删除 |
+| Keep | 50% | 保持原样 |
+
+**训练配置**:
+
+| 配置 | 值 |
+|------|-----|
+| 架构 | Encoder-Decoder 各 6 层（与 Stage 2 一致） |
+| Embed dim / Heads / FFN | 512 / 8 / 2048 |
+| Max length | 64 |
+| Epochs | 200 |
+| Optimizer | AdamW (weight_decay=1e-4) |
+| Peak LR | 3e-4, warmup 10 epochs + cosine decay |
+| Batch size | 64 |
+| Grad clip | global norm 1.0 |
+| 验证 | 每 5 epoch，5% 验证集重建损失 |
+| 早停 | val loss 连续 5 次不降 |
+
+```bash
+# Stage 1: 去噪预训练（需先运行 prepare_ai_challenger.py 生成 TSV）
+python src/translation/translate_denoise_pretrain_stax.py
+```
+
+输出:
+| 文件 | 内容 |
+|------|------|
+| `ckpt/translate_denoise_pretrain.pkl` | 预训练权重（供 Stage 2 加载） |
+| `translate_denoise_pretrain/` | 日志、词汇表、训练曲线、历史记录 |
+
+#### Stage 2: 翻译微调
+
+**权重迁移策略**:
+
+| 组件 | 来源 | 说明 |
+|------|------|------|
+| Encoder Embedding | **新初始化** | 英文词表，无法复用中文词表 |
+| Encoder PE | 迁移自 Stage 1 | 相同 max_len，直接复制 |
+| Encoder Blocks | 迁移自 Stage 1 | 相同结构，完整迁移 |
+| Decoder（全部） | 迁移自 Stage 1 | 中文词表匹配则完整迁移 |
+
+加载预训练权重后，在 AiChallenger 平行语料上微调 EN→ZH 翻译。Decoder 已具备中文生成能力，微调主要学习跨语言映射。
+
+**训练配置**（与单阶段对比）:
+
+| 配置 | 两阶段 Stage 2 | 单阶段 |
+|------|----------------|--------|
+| Peak LR | 1e-4（更低） | 3e-5 |
+| Warmup | 5 epochs | 4000 steps |
+| Epochs | 200 | 10000 |
+| 验证频率 | 每 10 epoch | 每 10 epoch |
+| 早停 | 5 次 | 3 次 |
+| 初始化 | Stage 1 预训练权重 | 随机初始化 |
+
+```bash
+# Stage 2: 翻译微调（需先完成 Stage 1）
+python src/translation/translate_denoise_finetune_stax.py
+```
+
+输出:
+| 文件 | 内容 |
+|------|------|
+| `translate_denoise_finetune/model_ai_challenger_zh_en_best.pkl` | 最佳微调模型 |
+| `translate_denoise_finetune/` | 日志、词汇表、训练曲线、历史记录 |
+
+#### 脚本对比
+
+| 脚本 | 方法 | 优点 | 缺点 |
+|------|------|------|------|
+| `translate_stax_flash.py` | 单阶段端到端 | 简单直接，一次跑完 | 仅利用平行数据 |
+| `translate_denoise_pretrain_stax.py` + `translate_denoise_finetune_stax.py` | 两阶段 BART | 利用海量单语数据预训练解码器，生成质量更高 | 需要两阶段运行，流程更长 |
 
 ## License
 
