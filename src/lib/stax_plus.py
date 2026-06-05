@@ -453,6 +453,13 @@ def parallel(*layers):
 def shape_dependent(make_layer):
   """Combinator to delay layer constructor pair until input shapes are known.
 
+  Supports both stateless and stateful (BatchNorm-containing) inner layers.
+  When the inner layer is stateful, init returns a 3-tuple so that
+  :func:`serial` / :func:`parallel` thread BN state correctly.
+
+  ``params`` stays a clean pytree (no function references), so operations
+  like ``tree_map(zeros_like, params)`` work as expected.
+
   Args:
     make_layer: a one-argument function that takes an input shape as an argument
       (a tuple of positive integers) and returns an (init_fun, apply_fun) pair.
@@ -463,9 +470,33 @@ def shape_dependent(make_layer):
     input shapes are known.
   """
   def init_fun(rng, input_shape):
-    return make_layer(input_shape)[0](rng, input_shape)
-  def apply_fun(params, inputs, **kwargs):
-    return make_layer(inputs.shape)[1](params, inputs, **kwargs)
+    inner_init, _ = make_layer(input_shape)
+    result = inner_init(rng, input_shape)
+    if len(result) == 3:
+      shape, inner_params, inner_bn = result
+      return shape, inner_params, inner_bn
+    else:
+      shape, inner_params = result
+      return shape, inner_params
+
+  def apply_fun(params, *args, **kwargs):
+    # Sniff calling convention from positional args:
+    #   stateful  → apply_fun(params, bn_state, inputs, **kwargs)  → len(args)==2
+    #   stateless → apply_fun(params, inputs, **kwargs)           → len(args)==1
+    if len(args) == 2:
+      bn_state, inputs = args
+    else:
+      inputs = args[0]
+      bn_state = None
+
+    _, inner_apply = make_layer(inputs.shape)
+
+    if bn_state is not None:
+      output, new_bn = inner_apply(params, bn_state, inputs, **kwargs)
+      return output, new_bn
+    else:
+      return inner_apply(params, inputs, **kwargs)
+
   return init_fun, apply_fun
 
 def GroupNorm(num_groups=32, epsilon=1e-5):
