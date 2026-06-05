@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python3)",
-      "Bash(python3 -c \"import py_compile; py_compile.compile\\('src/translation/translate_denoise_pretrain_stax.py', doraise=True\\); print\\('Syntax OK'\\)\")"
-    ]
-  }
-}
