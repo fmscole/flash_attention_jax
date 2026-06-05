@@ -1,294 +1,238 @@
 # Flash Attention JAX
 
-基于 JAX 的 Flash Attention 实现，包含 v1 和 v2 (FlashAttention-2) 两个版本，
-以及基于它们的 Transformer、Vision Transformer (ViT) 和 翻译模型 示例应用。
+JAX implementation of Flash Attention (v1 & v2) with custom VJPs for memory-efficient exact attention. Built on top are Transformer building blocks, a Vision Transformer (ViT) for CIFAR-10, and an English→Chinese translation model.
 
-实现参考了 [lucidrains/flash-attention-jax](https://github.com/lucidrains/flash-attention-jax)。
+## Installation
 
-## 核心模块
+```bash
+pip install jax optax torch torchvision numpy matplotlib jieba opencc
+```
 
-| 模块 | 说明 |
-|------|------|
-| `flash_attention/` | **核心** — Flash Attention v1 & v2，自定义 VJP |
-| `lib/` | Stax 扩展层（Dense, Dropout, LayerNorm, Conv, BatchNorm 等） |
-| `transformers/` | 基于 Flash Attention 的 Transformer 编码器/解码器 |
-| `translation/` | 翻译模型示例（EN→ZH，基于 Transformer + Flash Attention） |
-| `vit/` | Vision Transformer 示例（含 MAE 预训练）— 单阶段 CIFAR-10 90~91%，两阶段 MAE+微调 **94.92%** |
+No package install needed — import from `src/` directly:
+
+```python
+import sys
+sys.path.insert(0, 'src')
+from flash_attention import flash_attention, flash_attention_v2
+```
 
 ## Flash Attention
 
-- **v1** (`flash_attention_v1.py`): 标准实现，Q-block outer / KV-block inner 循环
-- **v2** (`flash_attention_v2.py`): FlashAttention-2，KV-block outer / Q-block inner 循环
-  反向传播循环顺序优化（对应 FA2 论文 §3.2）
+The core module provides two variants of block-sparse Flash Attention, both with manual VJP (custom gradient) implementations that avoid materializing the full `seq_len × seq_len` attention matrix.
 
-两者前向/反向数值一致（差异 < 1e-5）。
+### API
 
-### 用法
+Both functions share the same signature:
+
+```
+flash_attention(q, k, v, padding_mask_k=None, padding_mask_q=None,
+                causal=False, block_size_q=128, block_size_kv=128)
+flash_attention_v2(q, k, v, padding_mask_k=None, padding_mask_q=None,
+                   causal=False, block_size_q=128, block_size_kv=128)
+```
+
+**Inputs:**
+
+| Parameter | Shape | Description |
+|-----------|-------|-------------|
+| `q` | `[batch_heads, seq_len, head_dim]` | Query. `batch_heads = batch_size × num_heads` |
+| `k` | `[batch_heads, kv_seq_len, head_dim]` | Key |
+| `v` | `[batch_heads, kv_seq_len, head_dim]` | Value |
+| `padding_mask_k` | `[batch_heads, kv_seq_len]` or `None` | Boolean mask. `True` = valid, `False` = pad |
+| `padding_mask_q` | `[batch_heads, seq_len]` or `None` | Same convention as above |
+| `causal` | `bool` | If `True`, applies causal masking |
+| `block_size_q` | `int` | Tile size along query dimension |
+| `block_size_kv` | `int` | Tile size along key/value dimension |
+
+**Returns:** `[batch_heads, seq_len, head_dim]`
+
+**Important:** Inputs use `[batch_heads, ...]` format (batch and heads merged into one dimension). Use `q.reshape(batch * n_heads, seq, d)` before calling.
+
+### v1 vs v2
+
+| | v1 (`flash_attention`) | v2 (`flash_attention_v2`) |
+|---|---|---|
+| **Forward loop** | Q-block outer, KV-block inner | KV-block outer, Q-block inner |
+| **Backward loop** | Same as forward (Q-outer, KV-inner) | Same as forward (KV-outer, Q-inner) |
+| **Reference** | Standard Flash Attention | FlashAttention-2 (Dao 2023) §3.2 |
+| **Numerical** | Identical to v2 (diff < 1e-5) | Identical to v1 |
+
+v2's KV-outer backward loop reduces SRAM writes compared to v1, matching the FlashAttention-2 paper's sequence-length parallelism optimization. Both produce identical forward/gradient values.
 
 ```python
-from flash_attention import flash_attention_v1, flash_attention_v2
+from flash_attention import flash_attention, flash_attention_v2
 
-# v1
-output = flash_attention_v1(q, k, v, block_size_q=128, block_size_kv=128)
-
-# v2
-output = flash_attention_v2(q, k, v, causal=True, block_size_q=128, block_size_kv=128)
+# Same call for both
+out1 = flash_attention(q, k, v, causal=True, block_size_q=128, block_size_kv=128)
+out2 = flash_attention_v2(q, k, v, causal=True, block_size_q=128, block_size_kv=128)
+assert jnp.allclose(out1, out2, atol=1e-5)
 ```
 
-### 数值稳定性
+### Numerical Stability
 
-分块模式下 (block_size < seq_len) 使用统一的 `_MIN_NORMALIZER=1e-12` 确保
-前向归一化和反向 log-sum-exp 恢复权重完全一致，消除梯度漂移。
+When `block_size < seq_len`, the attention is computed in tiles. The normalization uses a unified epsilon (`1e-12`) shared between the forward softmax and the backward log-sum-exp recovery, ensuring the backward `exp(S - L)` exactly recovers the forward weights. This eliminates gradient drift that can cause training collapse at large sequence lengths.
 
-## Vision Transformer (CIFAR-10)
-
-三个示例脚本，覆盖从零训练到两阶段自监督微调的完整流程。
-
-### 脚本对比
-
-| 脚本 | 方法 | 准确率 | 前置依赖 |
-|------|------|--------|----------|
-| `vit_cifar10_stax.py` | 端到端监督训练 | 90~91% | 无 |
-| `vit_cifar10_mae_pretrain_stax.py` | Stage 1: MAE 自监督预训练（重建 masked patches） | — | 无 |
-| `vit_cifar10_mae_finetune_stax.py` | Stage 2: 加载预训练 Encoder + 分类头微调 | **94.92%** | `ckpt/vit_cifar10_mae_pretrain.pkl` |
-
-### 模型架构
-
-三者共享相同的 backbone 设计（CIFAR-10 图像 32×32）：
-
-- **Patch Embed**: Conv 4×4, stride 4 → 64 patches（每块 4×4×3=48 维）
-- **Embed dim**: 384, **Heads**: 6, **Layers**: 7, **MLP dim**: 768
-- **位置编码**: 可学习（非正弦固定）
-- **注意力**: Flash Attention v1（通过 `TransformerEncoderBlock`）
-
-### 用法
+### Running Tests
 
 ```bash
-# 1. 端到端监督训练（约 500 epoch）
+# Unit tests for both v1 and v2 (self-contained, no extra deps)
+python src/flash_attention/flash_attention_v1.py
+python src/flash_attention/flash_attention_v2.py
+
+# Dedicated v1 test suite
+python src/flash_attention/flash_attention_test.py
+```
+
+Each file includes a `__main__` block with test classes covering forward/backward with and without masks, causal mode, numerical stability, and block-size variants.
+
+## Transformers
+
+Building blocks on top of Flash Attention. Two parallel implementations: `transformer_flash_v1` (uses `flash_attention`) and `transformer_flash_v2` (uses `flash_attention_v2`). They have identical APIs and interchangeable outputs.
+
+### Components
+
+```python
+from transformers.transformer_flash_v1 import (
+    Embedding, PositionalEncoding,
+    MultiHeadSelfAttention, MultiHeadCrossAttention,
+    TransformerEncoderBlock, TransformerDecoderBlock,
+    TransformerEncoder, TransformerDecoder,
+    Transformer,  # full encoder-decoder model
+)
+```
+
+| Component | Description |
+|-----------|-------------|
+| `Embedding(num_embeddings, dim)` | Token embedding via `jnp.take` |
+| `PositionalEncoding(max_len, dim)` | Learned positional encoding |
+| `MultiHeadSelfAttention(n_heads, head_dim, causal, block_size_q, block_size_kv)` | QKV projection → flash attention → output projection |
+| `MultiHeadCrossAttention(n_heads, head_dim, ...)` | Cross-attention with separate Q from K/V |
+| `TransformerEncoderBlock(n_heads, head_dim, embed_dim, mlp_dim, dropout_rate)` | Pre-LN: Self-Attn → FFN, both with residual |
+| `TransformerDecoderBlock(n_heads, head_dim, embed_dim, mlp_dim, dropout_rate)` | Pre-LN: Causal Self-Attn → Cross-Attn → FFN |
+| `TransformerEncoder(num_layers, ...)` | Stacks encoder blocks + final LayerNorm |
+| `TransformerDecoder(num_layers, ...)` | Stacks decoder blocks + final LayerNorm |
+| `Transformer(src_vocab_size, tgt_vocab_size, embed_dim, n_heads, head_dim, mlp_dim, num_encoder_layers, num_decoder_layers, max_len, block_size)` | Full encoder-decoder. Returns `(init, apply, encode, decode)` |
+
+All Transformer modules use **Pre-LN** architecture. Dropout is controlled via the `is_training` keyword argument to `apply`.
+
+### Shape Convention
+
+The Transformer modules flatten batch and head dimensions internally. Users work with standard shapes:
+
+```python
+# Input: [batch, seq_len]
+# The Transformer handles the [batch, seq_len] → [batch_heads, seq, head_dim] reshaping internally.
+```
+
+### MAE Utilities
+
+```python
+from transformers.mae_utils import random_masking, unshuffle
+```
+
+| Function | Purpose |
+|----------|---------|
+| `random_masking(x, mask_ratio, rng)` → `(x_visible, ids_restore, mask)` | Randomly masks patches for MAE pretraining |
+| `unshuffle(x_visible, ids_restore, mask_token, num_patches)` | Restores encoded visible patches to full sequence with mask tokens |
+
+### Layer Library (`lib.stax_plus`)
+
+Extended JAX stax layer library used internally by the Transformer modules:
+
+```python
+from lib.stax_plus import Dense, Conv, LayerNorm, BatchNorm, Dropout, Gelu, serial, parallel
+```
+
+Stateful-aware `serial()`/`parallel()` combinators transparently thread BatchNorm state and handle 3-tuple init returns.
+
+## ViT: Vision Transformer (CIFAR-10)
+
+A Vision Transformer for CIFAR-10 classification.
+
+```
+src/vit/
+└── vit_cifar10_stax.py              # End-to-end supervised training
+```
+
+### Usage
+
+```bash
 python src/vit/vit_cifar10_stax.py
-
-# 2. MAE 自监督预训练（100 epoch，仅重建损失，不需标签）
-python src/vit/vit_cifar10_mae_pretrain_stax.py
-
-# 3. 加载预训练权重微调（100 epoch，需先完成 step 2）
-python src/vit/vit_cifar10_mae_finetune_stax.py
 ```
 
-### 训练细节
+### Architecture
 
-| 配置 | 监督 (vit_cifar10_stax) | MAE 预训练 | MAE 微调 |
-|------|------------------------|------------|----------|
-| Epochs | 500 | 100 | 100 |
-| Optimizer | AdamW | AdamW | AdamW |
-| Peak LR | 3e-4 | 1.5e-4 | 1e-4 |
-| LR schedule | warmup 10ep + cosine decay | warmup 20ep + cosine decay | warmup 20ep + cosine decay |
-| Weight decay | 0.1 | 0.05 | 0.05 |
-| Batch size | 128 | 128 | 128 |
-| Dropout | 0.2 | — | 0.1 |
-| Data aug | RandAugment + MixUp(α=0.8) | RandomCrop + Flip | RandAugment + MixUp(α=0.8) |
-| Label smoothing | 0.1 | — | 0.1 |
+| Component | Config |
+|-----------|--------|
+| Patch embed | Conv 4×4, stride 4 → 64 patches |
+| Embed dim | 384 |
+| Heads | 6 |
+| Layers | 7 |
+| MLP dim | 768 |
+| Positional encoding | Learned (not sinusoidal) |
+| Attention | Flash Attention v1 |
 
-**对比**: 单阶段监督训练可达 90–91%；两阶段 MAE 自监督预训练 + 微调可达 **94.92%**（高出约 4–5 个百分点）。
+### Training Details
 
-## 翻译模型 (EN→ZH)
+| Config | Value |
+|--------|-------|
+| Epochs | 500 |
+| Peak LR | 3e-4, warmup 10 epochs + cosine decay |
+| Batch size | 128 |
+| Optimizer | AdamW (weight_decay=0.1) |
+| Data augmentation | RandAugment + MixUp(α=0.8) |
+| Label smoothing | 0.1 |
+| Accuracy | 90~91% |
 
-基于 Flash Attention 的 Encoder-Decoder Transformer，使用 AiChallenger 机器翻译数据集（1000 万句对）进行训练。
+## Translation: EN→ZH
 
-提供两种训练路径：
-- **单阶段**: 随机初始化，直接在平行语料上端到端训练
-- **两阶段**: BART 风格 — Stage 1 在单语中文上做去噪预训练，Stage 2 加载预训练权重微调翻译
+Encoder-decoder Transformer for English→Chinese translation on the AiChallenger dataset (~10M sentence pairs).
 
-### 数据集
+```
+src/translation/
+├── prepare_ai_challenger.py              # Dataset preprocessing
+└── translate_stax_flash.py               # Single-stage end-to-end training
+```
 
-**AiChallenger 机器翻译数据集** — 通用领域中英平行语料，约 1000 万句对。
-
-- 下载地址: [AiChallenger 机器翻译](https://aistudio.baidu.com/datasetdetail/220848)
-- 本地路径: `H:\data_set\AiChallenger\`
-- 格式: 已对齐的 `train.en` / `train.zh`（各 1000 万行，行号对应）
-- 验证集: `valid.en-zh.en.sgm` / `valid.en-zh.zh.sgm`（各 8000 句）
-- 清洗脚本: `src/translation/prepare_ai_challenger.py`
+### Dataset Preparation
 
 ```bash
-# 从原始文件生成训练集 + 验证集 TSV（默认输出 300 万句对训练 + 8000 句对验证）
+# Generate training TSV from raw AiChallenger files
 python src/translation/prepare_ai_challenger.py
 ```
 
-输出:
-| 文件 | 内容 | 大小 |
-|------|------|------|
-| `data/ai_challenger_zh_en.tsv` | 训练集 (en\tzh) | ~232 MB |
-| `data/ai_challenger_valid_zh_en.tsv` | 官方验证集 (en\tzh) | ~887 KB |
+Requires the [AiChallenger Machine Translation dataset](https://aistudio.baidu.com/datasetdetail/220848).
 
-### 模型架构
-
-| 组件 | 配置 |
-|------|------|
-| Encoder / Decoder | 各 6 层 Pre-LN Transformer |
-| Attention | Flash Attention v1（通过 `Transformer` 封装） |
-| Hidden dim | 512 (8 heads × 64 head_dim) |
-| FFN dim | 2048 |
-| 词表 | 各 55,000（BPE-free，基于词频构建） |
-| 特殊标记 | `<pad>`, `<sos>`, `<eos>`, `<unk>` |
-
-### 用法
+### Usage
 
 ```bash
-# 训练（需先运行 prepare_ai_challenger.py 生成 TSV）
+# Train from scratch on parallel data
 python src/translation/translate_stax_flash.py
 ```
 
-### 训练细节
+### Architecture
 
-| 配置 | 值 |
-|------|-----|
-| 数据集 | AiChallenger 机器翻译（通用领域，~1000 万句对） |
-| 训练模式 | epoch-based |
-| Max epochs | 10000（早停触发终止） |
-| Optimizer | AdamW (weight_decay=1e-4) |
+| Component | Config |
+|-----------|--------|
+| Encoder / Decoder | 6 layers each, Pre-LN |
+| Embed dim | 512 (8 heads × 64) |
+| FFN dim | 2048 |
+| Vocab | ~55K (frequency-based, BPE-free) |
+| Max length | 64 |
+| Attention | Flash Attention v1 |
+| Inference | Greedy decoding |
+
+### Training Details
+
+| Config | Value |
+|--------|-------|
+| Epochs | 10000 (early stop) |
 | Peak LR | 3e-5, warmup 4000 steps, cosine decay → 1e-5 |
 | Batch size | 64 |
-| Max length | 64 |
-| Grad clip | global norm 1.0 |
-| 保存 | 每 epoch 自动保存 — `model_ai_challenger_zh_en.pkl`（含优化器状态），重启自动恢复 |
-| 训练曲线 | 每 epoch 更新绘制 → `translate_jax/model_ai_challenger_zh_en_curve.png` |
-| 验证 | 每 10 epoch — 官方验证集 8000 句（非随机切分），通过时保存 `*_best.pkl` |
-| 早停 | val loss 连续 3 次验证不降即停（约 30 epoch） |
-
-推理时使用贪心解码，每个时间步取 argmax，遇到 `<eos>` 停止。
-
-### 训练进展
-
-**Epoch 1**（batch_size=64，46875 batches）:
-
-| 指标 | 值 |
-|------|-----|
-| Loss（batch 0） | 10.90 |
-| Loss（batch 500） | 9.95 |
-| Loss（batch 44500–46500） | 2.90 ~ 3.24 |
-| Grad norm | 3.0 ~ 4.0 |
-
-第 1 个 epoch 结束时的翻译示例（贪心解码）:
-
-```
-EN: they planted roses along the fence every spring morning
-ZH: 每天早上他们都在<unk><unk>了玫瑰
-
-EN: he missed the train because his alarm never rang
-ZH: 他错过了火车因为他的警报没有
-
-EN: he is also very famous in japan
-ZH: 他也是日本人
-
-EN: i don 't expect anything from you
-ZH: 我不希望你能得到什么
-
-EN: i found it easy to speak english
-ZH: 我知道说英语很容易
-
-EN: she opened the old wooden box and found a letter inside
-ZH: 她打开了旧的<unk>在里面找到了一封信
-
-EN: time passes quickly when we 're doing something we like .
-ZH: 我们现在的时候需要的时候时间就快
-
-EN: tom needs to study more if he hopes to pass this class .
-ZH: 如果他希望通过这个课需要更多学习
-```
-
-### 两阶段训练：去噪预训练 + 翻译微调
-
-除单阶段端到端训练外，还提供两阶段 BART 风格训练路径，利用海量单语中文数据预训练解码器生成能力，再迁移到平行翻译任务。
-
-**参考**: Lewis et al. "BART: Denoising Sequence-to-Sequence Pre-training for Natural Language Generation, Translation, and Comprehension" (2019)
-
-#### 流程概览
-
-| 阶段 | 脚本 | 任务 | 数据 | 输出 |
-|------|------|------|------|------|
-| Stage 1 | `translate_denoise_pretrain_stax.py` | BART 去噪自编码（破坏中文 → 重建中文） | 单语中文（从 AiChallenger TSV 提取） | `ckpt/translate_denoise_pretrain.pkl` |
-| Stage 2 | `translate_denoise_finetune_stax.py` | 翻译微调（EN → ZH） | AiChallenger 平行语料 | 最终翻译模型 |
-
-#### Stage 1: 去噪预训练
-
-**原理**: Encoder 接收被破坏的中文文本（随机 mask + 删除），Decoder 重建原文。此阶段学习：
-- **Decoder**: 生成流畅中文的能力（完整迁移到 Stage 2）
-- **Encoder blocks**: 通用序列表示能力（迁移到 Stage 2）
-- **Encoder embedding**: 中文词语义（Stage 2 替换为英文 embedding）
-
-**破坏策略**:
-| 操作 | 比例 | 说明 |
-|------|------|------|
-| Token Masking | 30% | 替换为 `<mask>` 标记 |
-| Token Deletion | 20% | 直接删除 |
-| Keep | 50% | 保持原样 |
-
-**训练配置**:
-
-| 配置 | 值 |
-|------|-----|
-| 架构 | Encoder-Decoder 各 6 层（与 Stage 2 一致） |
-| Embed dim / Heads / FFN | 512 / 8 / 2048 |
-| Max length | 64 |
-| Epochs | 200 |
 | Optimizer | AdamW (weight_decay=1e-4) |
-| Peak LR | 3e-4, warmup 10 epochs + cosine decay |
-| Batch size | 64 |
 | Grad clip | global norm 1.0 |
-| 验证 | 每 5 epoch，5% 验证集重建损失 |
-| 早停 | val loss 连续 5 次不降 |
-
-```bash
-# Stage 1: 去噪预训练（需先运行 prepare_ai_challenger.py 生成 TSV）
-python src/translation/translate_denoise_pretrain_stax.py
-```
-
-输出:
-| 文件 | 内容 |
-|------|------|
-| `ckpt/translate_denoise_pretrain.pkl` | 预训练权重（供 Stage 2 加载） |
-| `translate_denoise_pretrain/` | 日志、词汇表、训练曲线、历史记录 |
-
-#### Stage 2: 翻译微调
-
-**权重迁移策略**:
-
-| 组件 | 来源 | 说明 |
-|------|------|------|
-| Encoder Embedding | **新初始化** | 英文词表，无法复用中文词表 |
-| Encoder PE | 迁移自 Stage 1 | 相同 max_len，直接复制 |
-| Encoder Blocks | 迁移自 Stage 1 | 相同结构，完整迁移 |
-| Decoder（全部） | 迁移自 Stage 1 | 中文词表匹配则完整迁移 |
-
-加载预训练权重后，在 AiChallenger 平行语料上微调 EN→ZH 翻译。Decoder 已具备中文生成能力，微调主要学习跨语言映射。
-
-**训练配置**（与单阶段对比）:
-
-| 配置 | 两阶段 Stage 2 | 单阶段 |
-|------|----------------|--------|
-| Peak LR | 1e-4（更低） | 3e-5 |
-| Warmup | 5 epochs | 4000 steps |
-| Epochs | 200 | 10000 |
-| 验证频率 | 每 10 epoch | 每 10 epoch |
-| 早停 | 5 次 | 3 次 |
-| 初始化 | Stage 1 预训练权重 | 随机初始化 |
-
-```bash
-# Stage 2: 翻译微调（需先完成 Stage 1）
-python src/translation/translate_denoise_finetune_stax.py
-```
-
-输出:
-| 文件 | 内容 |
-|------|------|
-| `translate_denoise_finetune/model_ai_challenger_zh_en_best.pkl` | 最佳微调模型 |
-| `translate_denoise_finetune/` | 日志、词汇表、训练曲线、历史记录 |
-
-#### 脚本对比
-
-| 脚本 | 方法 | 优点 | 缺点 |
-|------|------|------|------|
-| `translate_stax_flash.py` | 单阶段端到端 | 简单直接，一次跑完 | 仅利用平行数据 |
-| `translate_denoise_pretrain_stax.py` + `translate_denoise_finetune_stax.py` | 两阶段 BART | 利用海量单语数据预训练解码器，生成质量更高 | 需要两阶段运行，流程更长 |
+| Early stop | val loss no improvement for 3 validations |
+| Inference | Greedy decoding, stop at `<eos>` |
 
 ## License
 
